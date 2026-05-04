@@ -8,10 +8,11 @@ import React, { useEffect } from 'react';
  */
 const FacebookSDK: React.FC = () => {
   useEffect(() => {
-    const fbAppId = import.meta.env.VITE_FB_APP_ID;
+    const env = (import.meta as any).env || {};
+    const fbAppId = env.VITE_FB_APP_ID;
 
     if (!fbAppId) {
-      console.error("VITE_FB_APP_ID is not defined in environment variables.");
+      console.warn("VITE_FB_APP_ID is not defined in environment variables. Facebook SDK will not be initialized.");
       return;
     }
 
