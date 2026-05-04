@@ -3,7 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useMemo } from "react";
+"use client";
+
+import React, { useState, useMemo, useEffect } from "react";
+import { useSupabaseRealtime } from "./hooks/useSupabaseRealtime";
 import { motion, AnimatePresence } from "motion/react";
 import { QRCodeCanvas } from 'qrcode.react';
 import {
@@ -24,6 +27,7 @@ import {
   Pie
 } from 'recharts';
 import { GoogleGenAI } from "@google/genai";
+import { useAuth } from "@/src/context/AuthContext";
 import { supabase, isSupabaseConfigured } from "./lib/supabase";
 import { 
   Home, 
@@ -171,25 +175,30 @@ interface Lead {
 
 const getApiKey = () => {
   try {
-    // Try process.env (Vite define) or import.meta.env (standard Vite)
-    return process.env.GEMINI_API_KEY || (import.meta as any).env?.VITE_GEMINI_API_KEY || "";
+    return process.env.NEXT_PUBLIC_GEMINI_API_KEY || "";
   } catch (e) {
     return "";
   }
 };
 
-const apiKey = getApiKey();
-const ai = new GoogleGenAI({ apiKey });
+let aiInstance: GoogleGenAI | null = null;
+const getAI = () => {
+  if (!aiInstance) {
+    const apiKey = getApiKey();
+    aiInstance = new GoogleGenAI({ apiKey: apiKey || "dummy-key" });
+  }
+  return aiInstance;
+};
 
 // Memory-based cache for WhatsApp configurations (populated from DB)
 let memoryWahaConfigs: Record<string, any> = {};
 
 const getStoredWahaConfigs = () => {
-  const env = (import.meta as any).env || {};
+  const env = process.env || {};
   const envConfig = {
-    url: env.VITE_WAHA_URL || env.WAHA_URL || "",
-    session: env.VITE_WAHA_SESSION || "default",
-    apiKey: env.VITE_WAHA_API_KEY || ""
+    url: env.NEXT_PUBLIC_WAHA_URL || env.WAHA_URL || "",
+    session: env.NEXT_PUBLIC_WAHA_SESSION || "default",
+    apiKey: env.NEXT_PUBLIC_WAHA_API_KEY || ""
   };
 
   // 1. Check memory cache (populated from database)
@@ -406,43 +415,49 @@ interface User {
  * 5. Multi-Platform Orchestration: Posting engine with AI content optimization.
  */
 export default function App() {
-  // Persistence Layer: Load and save user directory to localStorage
-  const [users, setUsers] = useState<User[]>(() => {
-    // Initial Admin Bootstrap
+  const { currentUser, setCurrentUser, logout } = useAuth();
+  
+  // Use a local state for users only for management, but link with Auth if needed
+  const [users, setUsers] = useState<User[]>([]);
+  const [currentUserStorageLoaded, setCurrentUserStorageLoaded] = useState(false);
+
+  useEffect(() => {
+    const savedUsers = localStorage.getItem("app_users");
     const initialAdmin: User = {
       id: "admin-1",
       name: "Admin User",
       email: "admin@omniinbox.com",
       phone: "+8801700000000",
-      password: "admin123", // Matches Supabase demo
+      password: "admin123",
       role: "Super Admin",
       avatar: "https://api.dicebear.com/7.x/avataaars/svg?seed=admin",
       joinedDate: "April 02, 2024"
     };
 
-    const saved = localStorage.getItem("app_users");
-    if (saved) {
+    if (savedUsers) {
       try {
-        const parsed = JSON.parse(saved);
+        const parsed = JSON.parse(savedUsers);
         if (Array.isArray(parsed)) {
-          // Ensure admin is always in the list
-          if (!parsed.find(u => u.id === initialAdmin.id || u.email.toLowerCase() === initialAdmin.email.toLowerCase())) {
-            return [initialAdmin, ...parsed];
+          if (!parsed.find(u => u.email === initialAdmin.email)) {
+            setUsers([initialAdmin, ...parsed]);
+          } else {
+            setUsers(parsed);
           }
-          return parsed;
+        } else {
+          setUsers([initialAdmin]);
         }
       } catch (e) {
-        console.error("Error parsing saved users:", e);
+        setUsers([initialAdmin]);
       }
+    } else {
+      setUsers([initialAdmin]);
     }
-    return [initialAdmin];
-  });
+    setCurrentUserStorageLoaded(true);
+  }, []);
 
-  // Authentication State
-  const [currentUser, setCurrentUser] = useState<User | null>(() => {
-    const saved = localStorage.getItem("current_user");
-    return saved ? JSON.parse(saved) : null;
-  });
+  const handleLogout = () => {
+    logout();
+  };
 
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncProgress, setSyncProgress] = useState(0);
@@ -466,93 +481,6 @@ export default function App() {
   }, [isSyncing]);
 
   const [loginError, setLoginError] = useState("");
-  const [loginEmail, setLoginEmail] = useState("");
-  const [loginPassword, setLoginPassword] = useState("");
-  const [showLoginPassword, setShowLoginPassword] = useState(false);
-  const [loginTab, setLoginTab] = useState<"Super Admin" | "Executive">("Super Admin");
-  const [showForgotPassword, setShowForgotPassword] = useState(false);
-  const [resetEmail, setResetEmail] = useState("");
-  const [resetMessage, setResetMessage] = useState("");
-
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setLoginError("");
-    const email = loginEmail.trim();
-    const password = loginPassword;
-
-    console.log("Attempting login for:", email);
-    console.log("Available users in memory:", users.map(u => u.email));
-    console.log("Supabase configured:", isSupabaseConfigured);
-
-    // First try local users
-    let user = users.find(u => u.email.toLowerCase() === email.toLowerCase() && u.password === password);
-    if (user) console.log("User found in local state!");
-    
-    // If not found locally, try live check if Supabase is configured
-    if (!user && isSupabaseConfigured) {
-      console.log("User not found locally, checking Supabase...");
-      try {
-        const { data, error } = await supabase
-          .from('app_users')
-          .select('*')
-          .ilike('email', email)
-          .eq('password', password)
-          .maybeSingle();
-        
-        if (error) {
-          console.error("Supabase query error:", error);
-        }
-
-        if (data) {
-          console.log("User found in Supabase!");
-          user = data;
-          // Add to local users to avoid extra lookups next time
-          setUsers(prev => {
-            if (!prev.find(u => u.id === data.id)) {
-              const updated = [...prev, data];
-              localStorage.setItem("app_users", JSON.stringify(updated));
-              return updated;
-            }
-            return prev;
-          });
-        } else {
-          console.log("User not found in Supabase either.");
-        }
-      } catch (err) {
-        console.error("Supabase login check error:", err);
-      }
-    }
-
-    if (user) {
-      console.log("Login successful, checking role...");
-      if (user.role !== loginTab) {
-        console.warn(`Role mismatch: expected ${loginTab}, got ${user.role}`);
-        setLoginError(`This account is not registered as a ${loginTab}.`);
-        return;
-      }
-      setCurrentUser(user);
-      localStorage.setItem("current_user", JSON.stringify(user));
-    } else {
-      console.error("Login failed: User not found or password incorrect.");
-      setLoginError("Invalid email or password. Please try again.");
-    }
-  };
-
-  const handleForgotPassword = (e: React.FormEvent) => {
-    e.preventDefault();
-    const email = resetEmail.trim().toLowerCase();
-    const user = users.find(u => u.email.toLowerCase() === email);
-    if (user) {
-      setResetMessage(`Password for ${resetEmail} is: ${user.password}`);
-    } else {
-      setResetMessage("Email not found in our records.");
-    }
-  };
-
-  const handleLogout = () => {
-    setCurrentUser(null);
-    localStorage.removeItem("current_user");
-  };
 
   const updateCurrentUser = (updatedUser: User) => {
     setCurrentUser(updatedUser);
@@ -609,20 +537,33 @@ export default function App() {
     }
   };
 
-  const [logoUrl, setLogoUrl] = useState<string | null>(() => localStorage.getItem("app_logo"));
-  const [faviconUrl, setFaviconUrl] = useState<string | null>(() => localStorage.getItem("app_favicon"));
-  const [appName, setAppName] = useState<string>(() => localStorage.getItem("app_name") || "Amaizing IT");
-  const [appColors, setAppColors] = useState(() => {
-    const saved = localStorage.getItem("app_colors");
-    return saved ? JSON.parse(saved) : {
-      sidebarTop: "#14060a",
-      sidebarMiddle: "#a00c1c",
-      sidebarBottom: "#060203",
-      primaryAccent: "#f05340",
-      pageBg: "#0f172a",
-      cardBg: "#1e293b"
-    };
+  const [logoUrl, setLogoUrl] = useState<string | null>(null);
+  const [faviconUrl, setFaviconUrl] = useState<string | null>(null);
+  const [appName, setAppName] = useState<string>("Amaizing IT");
+  const [appColors, setAppColors] = useState({
+    sidebarTop: "#14060a",
+    sidebarMiddle: "#a00c1c",
+    sidebarBottom: "#060203",
+    primaryAccent: "#f05340",
+    pageBg: "#0f172a",
+    cardBg: "#1e293b"
   });
+
+  useEffect(() => {
+    const savedLogo = localStorage.getItem("app_logo");
+    const savedFavicon = localStorage.getItem("app_favicon");
+    const savedAppName = localStorage.getItem("app_name");
+    const savedColors = localStorage.getItem("app_colors");
+
+    if (savedLogo) setLogoUrl(savedLogo);
+    if (savedFavicon) setFaviconUrl(savedFavicon);
+    if (savedAppName) setAppName(savedAppName);
+    if (savedColors) {
+      try {
+        setAppColors(JSON.parse(savedColors));
+      } catch (e) {}
+    }
+  }, []);
 
   const [employees, setEmployees] = useState<Employee[]>([
     { 
@@ -1329,97 +1270,13 @@ export default function App() {
     return [];
   };
 
+  // Optimized Real-time Subscriptions using unified hook
+  useSupabaseRealtime(setChats, undefined, setLeads, setOrders);
+
   React.useEffect(() => {
     loadSupabaseData("App:useEffect:mount");
-
-    // 2. Real-time Subscriptions
-    let chatChannel: any, msgChannel: any, empChannel: any, orderChannel: any, leadChannel: any;
-
-    if (isSupabaseConfigured) {
-      chatChannel = supabase.channel('chats-realtime')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'chats' }, (payload) => {
-          if (payload.eventType === 'INSERT') {
-            const newChat = payload.new;
-            setChats(prev => {
-              if (prev.find(c => c.id === newChat.id)) return prev;
-              const formattedChat = {
-                ...newChat,
-                platformIcon: newChat.platform === 'whatsapp' ? <Phone className="w-3 h-3" /> : (newChat.platform === 'messenger' ? <Facebook className="w-3 h-3" /> : <Globe className="w-3 h-3" />),
-                platformColor: newChat.platform_color || (newChat.platform === 'whatsapp' ? 'bg-emerald-500' : 'bg-blue-500'),
-                time: newChat.last_time ? new Date(newChat.last_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : "",
-                avatar: newChat.name?.charAt(0) || "?",
-                messages: []
-              };
-              return [formattedChat as any, ...prev];
-            });
-          } else if (payload.eventType === 'UPDATE') {
-            setChats(prev => {
-              const updated = prev.map(c => c.id === payload.new.id ? { 
-                ...c, 
-                ...payload.new,
-                timestamp: payload.new.last_time ? new Date(payload.new.last_time).getTime() / 1000 : c.timestamp,
-                time: payload.new.last_time ? new Date(payload.new.last_time).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : c.time
-              } : c);
-              return [...updated].sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-            });
-          } else if (payload.eventType === 'DELETE') {
-            setChats(prev => prev.filter(c => c.id !== payload.old.id));
-          }
-        })
-        .subscribe();
-      
-      msgChannel = supabase.channel('messages-realtime')
-        .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'messages' }, (payload) => {
-          const newMsg = payload.new;
-          setChats(prev => prev.map(chat => {
-            if (chat.id === newMsg.chat_id) {
-              // Check if message already exists
-              if (chat.messages.find(m => m.id === newMsg.id)) return chat;
-              
-              return {
-                ...chat,
-                lastMsg: newMsg.text,
-                last_time: new Date().toISOString(),
-                timestamp: Date.now() / 1000,
-                unread: (chat.unread || 0) + 1,
-                time: new Date(newMsg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                messages: [...chat.messages, {
-                  id: newMsg.id,
-                  text: newMsg.text,
-                  sender: newMsg.sender,
-                  time: new Date(newMsg.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-                  type: newMsg.type || 'text',
-                  mediaUrl: newMsg.media_url,
-                  translatedText: newMsg.translated_text
-                }]
-              };
-            }
-            return chat;
-          }).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)));
-        })
-        .subscribe();
-
-      empChannel = supabase.channel('employees-realtime')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'employees' }, () => loadSupabaseData("App:realtime:employees"))
-        .subscribe();
-
-      orderChannel = supabase.channel('orders-realtime')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'orders' }, () => loadSupabaseData("App:realtime:orders"))
-        .subscribe();
-
-      leadChannel = supabase.channel('leads-realtime')
-        .on('postgres_changes', { event: '*', schema: 'public', table: 'leads' }, () => loadSupabaseData("App:realtime:leads"))
-        .subscribe();
-    }
-
-    return () => {
-      if (chatChannel) supabase.removeChannel(chatChannel);
-      if (msgChannel) supabase.removeChannel(msgChannel);
-      if (empChannel) supabase.removeChannel(empChannel);
-      if (orderChannel) supabase.removeChannel(orderChannel);
-      if (leadChannel) supabase.removeChannel(leadChannel);
-    };
   }, []);
+
 
   // 3. Global Polling for Live Sync (Messenger & WhatsApp)
   React.useEffect(() => {
@@ -1442,213 +1299,6 @@ export default function App() {
       link.href = faviconUrl;
     }
   }, [faviconUrl]);
-
-  if (!currentUser) {
-    return (
-      <div className="min-h-screen bg-[#0f172a] flex flex-col items-center justify-center p-6 font-sans">
-        {/* Logo Section */}
-        <div className="flex flex-col items-center mb-8">
-          {logoUrl ? (
-            <div className="w-16 h-16 bg-white rounded-2xl flex items-center justify-center overflow-hidden border border-slate-700 shadow-xl mb-4">
-              <img src={logoUrl} alt="Logo" className="w-full h-full object-cover" referrerPolicy="no-referrer" />
-            </div>
-          ) : (
-            <div className="w-16 h-16 bg-sky-500 rounded-2xl flex items-center justify-center border border-slate-700 shadow-xl mb-4">
-              <MessageSquare className="w-8 h-8 text-white" />
-            </div>
-          )}
-          <h2 className="text-slate-200 font-bold text-xl tracking-tight uppercase">{appName}</h2>
-        </div>
-
-        {/* Login Card */}
-        <motion.div
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          transition={{ duration: 0.5 }}
-          className="bg-[#1e2d45] w-full max-w-lg rounded-[2.5rem] shadow-[0_20px_50px_-12px_rgba(0,0,0,0.5)] p-12 border border-slate-700/50"
-        >
-          {showForgotPassword ? (
-            <>
-              <div className="flex items-center gap-4 mb-8">
-                <button 
-                  onClick={() => { setShowForgotPassword(false); setResetMessage(""); }}
-                  className="p-2 bg-slate-800 rounded-lg text-slate-400 hover:text-white transition-colors"
-                >
-                  <ChevronLeft className="w-5 h-5" />
-                </button>
-                <div>
-                  <h1 className="text-2xl font-bold text-white">Reset Password</h1>
-                  <p className="text-slate-400 text-sm font-medium">Enter your email to verify account.</p>
-                </div>
-              </div>
-
-              {resetMessage && (
-                <div className={`mb-6 p-4 rounded-xl flex items-center gap-3 ${resetMessage.includes('is:') ? 'bg-emerald-500/10 border border-emerald-500/20 text-emerald-400' : 'bg-rose-500/10 border border-rose-500/20 text-rose-400'}`}>
-                  {resetMessage.includes('is:') ? <CheckCircle2 className="w-5 h-5" /> : <AlertCircle className="w-5 h-5" />}
-                  <p className="text-xs font-bold uppercase tracking-wider">{resetMessage}</p>
-                </div>
-              )}
-
-              <form className="space-y-6" onSubmit={handleForgotPassword}>
-                <div>
-                  <label className="block text-slate-300 font-bold text-sm mb-2" htmlFor="reset-email">
-                    Email Address
-                  </label>
-                  <input
-                    id="reset-email"
-                    type="email"
-                    required
-                    value={resetEmail}
-                    onChange={(e) => setResetEmail(e.target.value)}
-                    className="w-full px-4 py-3 rounded-xl bg-[#0f172a] border border-slate-700 text-white focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20 outline-none transition-all placeholder:text-slate-600"
-                    placeholder="Enter your registered email"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  className="w-full bg-[#0a946b] hover:bg-[#08835d] text-white font-bold py-4 rounded-xl transition-all shadow-lg shadow-emerald-900/10 active:scale-[0.98] uppercase tracking-wider text-sm mt-4"
-                >
-                  Verify Email
-                </button>
-              </form>
-            </>
-          ) : (
-            <>
-              <div className="flex bg-[#0f172a] p-1 rounded-2xl mb-8 border border-slate-700/50">
-                <button
-                  onClick={() => { setLoginTab("Super Admin"); setLoginError(""); }}
-                  className={`flex-1 py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-all ${loginTab === "Super Admin" ? 'bg-[#0a946b] text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}
-                >
-                  Super Admin
-                </button>
-                <button
-                  onClick={() => { setLoginTab("Executive"); setLoginError(""); }}
-                  className={`flex-1 py-3 rounded-xl text-xs font-black uppercase tracking-widest transition-all ${loginTab === "Executive" ? 'bg-[#0a946b] text-white shadow-lg' : 'text-slate-500 hover:text-slate-300'}`}
-                >
-                  Employee
-                </button>
-              </div>
-
-              <h1 className="text-3xl font-bold text-white mb-2">Welcome back</h1>
-              <p className="text-slate-400 mb-6 font-medium">Sign in as <span className="text-emerald-400 font-bold">{loginTab}</span> to access your dashboard.</p>
-              
-              <div className="mb-8 p-3 bg-blue-500/5 border border-blue-500/10 rounded-xl relative group">
-                <p className="text-[10px] text-blue-400 font-bold uppercase tracking-widest mb-1">Demo Access</p>
-                <div className="flex justify-between items-center">
-                  <p className="text-xs text-slate-400 font-medium">
-                    {loginTab === "Super Admin" 
-                      ? "Email: admin@omniinbox.com | Pass: admin123" 
-                      : "Create an Executive account first in Admin Panel."}
-                  </p>
-                  {loginTab === "Super Admin" && (
-                    <button 
-                      type="button"
-                      onClick={() => {
-                        setLoginEmail("admin@omniinbox.com");
-                        setLoginPassword("admin123");
-                      }}
-                      className="text-[10px] bg-blue-500/20 hover:bg-blue-500/40 text-blue-300 px-2 py-1 rounded transition-colors font-bold uppercase"
-                    >
-                      Fill
-                    </button>
-                  )}
-                </div>
-              </div>
-
-              {loginError && (
-                <div className="mb-6 space-y-2">
-                  <div className="p-4 bg-rose-500/10 border border-rose-500/20 rounded-xl flex items-center gap-3">
-                    <AlertCircle className="w-5 h-5 text-rose-500" />
-                    <p className="text-xs font-bold text-rose-500 uppercase tracking-wider">{loginError}</p>
-                  </div>
-                  <button 
-                    type="button"
-                    onClick={() => {
-                      localStorage.clear();
-                      window.location.reload();
-                    }}
-                    className="text-[10px] text-slate-500 hover:text-slate-300 transition-colors uppercase tracking-[0.2em] font-black block mx-auto py-2"
-                  >
-                    Reset Application Data
-                  </button>
-                </div>
-              )}
-
-              <form className="space-y-6" onSubmit={handleLogin}>
-                <div>
-                  <label className="block text-slate-300 font-bold text-sm mb-2" htmlFor="email">
-                    Email
-                  </label>
-                  <input
-                    id="email"
-                    type="email"
-                    required
-                    value={loginEmail}
-                    onChange={(e) => setLoginEmail(e.target.value)}
-                    className="w-full px-4 py-3 rounded-xl bg-[#0f172a] border border-slate-700 text-white focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20 outline-none transition-all placeholder:text-slate-600"
-                    placeholder="name@company.com"
-                  />
-                </div>
-
-                <div>
-                  <div className="flex items-center justify-between mb-2">
-                    <label className="block text-slate-300 font-bold text-sm" htmlFor="password">
-                      Password
-                    </label>
-                    <button 
-                      type="button"
-                      onClick={() => setShowForgotPassword(true)}
-                      className="text-xs font-bold text-emerald-400 hover:text-emerald-300 transition-colors uppercase tracking-widest"
-                    >
-                      Forgot?
-                    </button>
-                  </div>
-                  <div className="relative">
-                    <input
-                      id="password"
-                      type={showLoginPassword ? "text" : "password"}
-                      required
-                      value={loginPassword}
-                      onChange={(e) => setLoginPassword(e.target.value)}
-                      className="w-full px-4 py-3 rounded-xl bg-[#0f172a] border border-slate-700 text-white focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20 outline-none transition-all placeholder:text-slate-600 pr-12"
-                      placeholder="••••••••"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => setShowLoginPassword(!showLoginPassword)}
-                      className="absolute right-4 top-1/2 -translate-y-1/2 text-slate-500 hover:text-slate-300 transition-colors"
-                    >
-                      {showLoginPassword ? <EyeOff className="w-5 h-5" /> : <Eye className="w-5 h-5" />}
-                    </button>
-                  </div>
-                </div>
-
-                <div className="flex items-center justify-between">
-                  <label className="flex items-center group cursor-pointer">
-                    <input
-                      type="checkbox"
-                      className="w-5 h-5 rounded border-slate-700 bg-[#0f172a] text-emerald-600 focus:ring-emerald-500 transition-colors cursor-pointer"
-                    />
-                    <span className="ml-3 text-slate-400 font-medium group-hover:text-white transition-colors">
-                      Remember me
-                    </span>
-                  </label>
-                </div>
-
-                <button
-                  type="submit"
-                  className="w-full bg-[#0a946b] hover:bg-[#08835d] text-white font-bold py-4 rounded-xl transition-all shadow-lg shadow-emerald-900/10 active:scale-[0.98] uppercase tracking-wider text-sm mt-4"
-                >
-                  Log In
-                </button>
-              </form>
-            </>
-          )}
-        </motion.div>
-      </div>
-    );
-  }
 
   return (
     <>
@@ -1843,50 +1493,60 @@ function Dashboard({
     joinedDate: currentUser.joinedDate
   }), [currentUser]);
 
-  const [permissions, setPermissions] = useState(() => {
+  const [permissions, setPermissions] = useState([
+    { name: "Connections", isSystem: true, description: "Manage WhatsApp and Messenger channel accounts (credentials, labels, active state).", slug: "connections.manage", roles: 1 },
+    { name: "Employees", isSystem: true, description: "Assign roles to team members.", slug: "employees.manage", roles: 1 },
+    { name: "Inbox", isSystem: true, description: "View and reply in the unified chats inbox.", slug: "inbox.access", roles: 1 },
+    { name: "Integration settings", isSystem: true, description: "View webhook URLs and integration shortcuts on Settings.", slug: "settings.integrations", roles: 1 },
+    { name: "LinkedIn", isSystem: true, description: "Connect and configure LinkedIn professional profiles.", slug: "linkedin.manage", roles: 1 },
+    { name: "Messenger", isSystem: true, description: "Connect and configure Facebook Messenger.", slug: "messenger.manage", roles: 1 },
+    { name: "Permissions", isSystem: true, description: "Create and edit permission definitions.", slug: "permissions.manage", roles: 1 },
+    { name: "Roles", isSystem: true, description: "Create and edit roles and their permissions.", slug: "roles.manage", roles: 1 },
+    { name: "TikTok", isSystem: true, description: "Connect and configure TikTok content accounts.", slug: "tiktok.manage", roles: 1 },
+    { name: "WhatsApp", isSystem: true, description: "Connect and configure WhatsApp Cloud API.", slug: "whatsapp.manage", roles: 1 },
+    { name: "X (Twitter)", isSystem: true, description: "Connect and configure X (formerly Twitter) accounts.", slug: "x.manage", roles: 1 },
+  ]);
+
+  useEffect(() => {
     const saved = localStorage.getItem("app_permissions");
-    return saved ? JSON.parse(saved) : [
-      { name: "Connections", isSystem: true, description: "Manage WhatsApp and Messenger channel accounts (credentials, labels, active state).", slug: "connections.manage", roles: 1 },
-      { name: "Employees", isSystem: true, description: "Assign roles to team members.", slug: "employees.manage", roles: 1 },
-      { name: "Inbox", isSystem: true, description: "View and reply in the unified chats inbox.", slug: "inbox.access", roles: 1 },
-      { name: "Integration settings", isSystem: true, description: "View webhook URLs and integration shortcuts on Settings.", slug: "settings.integrations", roles: 1 },
-      { name: "LinkedIn", isSystem: true, description: "Connect and configure LinkedIn professional profiles.", slug: "linkedin.manage", roles: 1 },
-      { name: "Messenger", isSystem: true, description: "Connect and configure Facebook Messenger.", slug: "messenger.manage", roles: 1 },
-      { name: "Permissions", isSystem: true, description: "Create and edit permission definitions.", slug: "permissions.manage", roles: 1 },
-      { name: "Roles", isSystem: true, description: "Create and edit roles and their permissions.", slug: "roles.manage", roles: 1 },
-      { name: "TikTok", isSystem: true, description: "Connect and configure TikTok content accounts.", slug: "tiktok.manage", roles: 1 },
-      { name: "WhatsApp", isSystem: true, description: "Connect and configure WhatsApp Cloud API.", slug: "whatsapp.manage", roles: 1 },
-      { name: "X (Twitter)", isSystem: true, description: "Connect and configure X (formerly Twitter) accounts.", slug: "x.manage", roles: 1 },
-    ];
-  });
+    if (saved) {
+      try {
+        setPermissions(JSON.parse(saved));
+      } catch (e) {}
+    }
+  }, []);
 
   React.useEffect(() => {
     localStorage.setItem("app_permissions", JSON.stringify(permissions));
   }, [permissions]);
 
-  const [roles, setRoles] = useState(() => {
+  const [roles, setRoles] = useState([
+    { 
+      name: "Administrator", 
+      isSystem: true, 
+      description: "Full access to messaging tools, team settings, and role management.", 
+      slug: "admin", 
+      panelAccess: true, 
+      permissions: ["connections.manage", "employees.manage", "inbox.access", "settings.integrations", "linkedin.manage", "messenger.manage", "permissions.manage", "roles.manage", "tiktok.manage", "whatsapp.manage", "x.manage"]
+    },
+    { 
+      name: "Executive", 
+      isSystem: true, 
+      description: "Access to inbox and assigned chats. Limited panel visibility.", 
+      slug: "executive", 
+      panelAccess: false, 
+      permissions: ["inbox.access"]
+    }
+  ]);
+
+  useEffect(() => {
     const saved = localStorage.getItem("app_roles");
-    return saved ? JSON.parse(saved) : [
-      { 
-        name: "Administrator", 
-        isSystem: true, 
-        description: "Full access to messaging tools, team settings, and role management.", 
-        slug: "admin", 
-        panelAccess: true, 
-        users: 1,
-        permissions: ["connections.manage", "employees.manage", "inbox.access", "settings.integrations", "permissions.manage", "roles.manage", "whatsapp.manage"]
-      },
-      { 
-        name: "Agent", 
-        isSystem: true, 
-        description: "Standard team member without admin panel access.", 
-        slug: "agent", 
-        panelAccess: false, 
-        users: 1,
-        permissions: ["inbox.access"]
-      }
-    ];
-  });
+    if (saved) {
+      try {
+        setRoles(JSON.parse(saved));
+      } catch (e) {}
+    }
+  }, []);
 
   React.useEffect(() => {
     localStorage.setItem("app_roles", JSON.stringify(roles));
@@ -3366,12 +3026,10 @@ function AIAssistantView() {
         finalPrompt = `Analyze this business idea and provide 3 growth tips: "${finalPrompt}".`;
       }
 
-      const result = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: finalPrompt,
-      });
-
-      setResponse(result.text || "No response received.");
+      const model = getAI().getGenerativeModel({ model: "gemini-1.5-flash" });
+      const result = await model.generateContent(finalPrompt);
+      const response = await result.response;
+      setResponse(response.text() || "No response received.");
     } catch (error) {
       console.error("AI Generation Error:", error);
       setResponse("Error generating content. Please check your connection.");
@@ -3626,13 +3284,14 @@ function WhatsAppView({
   const [syncProgress, setSyncProgress] = useState(0);
 
   const [wahaConfig, setWahaConfig] = useState(() => {
+    if (typeof window === "undefined") return { url: "", session: "default", apiKey: "" };
     const saved = localStorage.getItem("waha_configs");
     const configs = saved ? JSON.parse(saved) : {};
-    const env = (import.meta as any).env || {};
+    const env = process.env || {};
     const envConfig = {
-      url: env.VITE_WAHA_URL || env.WAHA_URL || "",
-      session: env.VITE_WAHA_SESSION || "default",
-      apiKey: env.VITE_WAHA_API_KEY || ""
+      url: env.NEXT_PUBLIC_WAHA_URL || env.WAHA_URL || "",
+      session: env.NEXT_PUBLIC_WAHA_SESSION || "default",
+      apiKey: env.NEXT_PUBLIC_WAHA_API_KEY || ""
     };
     
     // In Add Mode, generate a unique session ID if we don't have one yet
@@ -3845,9 +3504,9 @@ function WhatsAppView({
       setRealQr(null);
       setQrImage(null);
       setWahaConfig({
-        url: (import.meta as any).env?.VITE_WAHA_URL || (import.meta as any).env?.WAHA_URL || "http://localhost:3000",
+        url: process.env.NEXT_PUBLIC_WAHA_URL || process.env.WAHA_URL || "http://localhost:3000",
         session: "default",
-        apiKey: (import.meta as any).env?.VITE_WAHA_API_KEY || ""
+        apiKey: process.env.NEXT_PUBLIC_WAHA_API_KEY || ""
       });
       
       if (setChats) {
@@ -6663,13 +6322,13 @@ function ChatsView({
 
   const translateText = async (text: string, toLang: string = targetLanguage) => {
     try {
-      const result = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: `Translate the following text to ${toLang}. Return ONLY the translated text.
+      const model = getAI().getGenerativeModel({ model: "gemini-1.5-flash" });
+      const prompt = `Translate the following text to ${toLang}. Return ONLY the translated text.
         
-        Text: ${text}`,
-      });
-      return result.text?.trim() || text;
+        Text: ${text}`;
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      return response.text()?.trim() || text;
     } catch (err) {
       console.error(err);
       return text;
@@ -6725,14 +6384,14 @@ function ChatsView({
     setIsAIGenerating(true);
     try {
       const lastMessages = currentChat.messages.slice(-5).map(m => `${m.sender === 'me' ? 'Agent' : 'Customer'}: ${m.text}`).join("\n");
-      const result = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: `You are a professional customer support assistant for OmniInbox. Based on this conversation history, suggest a short, helpful, and polite reply for the agent to send. Reply only with the suggested text. Use the same language as the customer (Bengali or English).
+      const model = getAI().getGenerativeModel({ model: "gemini-1.5-flash" });
+      const prompt = `You are a professional customer support assistant for OmniInbox. Based on this conversation history, suggest a short, helpful, and polite reply for the agent to send. Reply only with the suggested text. Use the same language as the customer (Bengali or English).
         
         History:
-        ${lastMessages}`,
-      });
-      setMessageText(result.text?.trim() || "");
+        ${lastMessages}`;
+      const result = await model.generateContent(prompt);
+      const response = await result.response;
+      setMessageText(response.text()?.trim() || "");
     } catch (err) {
       console.error(err);
     } finally {
@@ -10622,26 +10281,41 @@ function SettingsView({
   const [tempFavicon, setTempFavicon] = React.useState<string | null>(faviconUrl);
   const [tempAppName, setTempAppName] = React.useState(appName);
   const [interfaceColors, setInterfaceColors] = React.useState(appColors);
-  const [enableSound, setEnableSound] = React.useState(() => localStorage.getItem("notify_sound") !== "false");
-  const [enableDesktop, setEnableDesktop] = React.useState(() => localStorage.getItem("notify_desktop") !== "false");
+  const [enableSound, setEnableSound] = React.useState(true);
+  const [enableDesktop, setEnableDesktop] = React.useState(true);
+
+  React.useEffect(() => {
+    if (typeof window !== "undefined") {
+      setEnableSound(localStorage.getItem("notify_sound") !== "false");
+      setEnableDesktop(localStorage.getItem("notify_desktop") !== "false");
+    }
+  }, []);
   const [isSaved, setIsSaved] = React.useState(false);
   const [isAppearanceSaved, setIsAppearanceSaved] = React.useState(false);
   const [isEmailSaved, setIsEmailSaved] = React.useState(false);
   const [showSmtpPassword, setShowSmtpPassword] = React.useState(false);
 
-  const [emailConfig, setEmailConfig] = React.useState(() => {
-    const saved = localStorage.getItem("email_config");
-    return saved ? JSON.parse(saved) : {
-      host: "mail.aaramaura.com",
-      port: "465",
-      username: "info@aaramaura.com",
-      password: "",
-      encryption: "TLS",
-      mailer: "smtp",
-      fromEmail: "info@aaramaura.com",
-      fromName: "Laravel"
-    };
+  const [emailConfig, setEmailConfig] = React.useState({
+    host: "mail.aaramaura.com",
+    port: "465",
+    username: "info@aaramaura.com",
+    password: "",
+    encryption: "TLS",
+    mailer: "smtp",
+    fromEmail: "info@aaramaura.com",
+    fromName: "OmniInbox AI Support",
+    templateHeader: "https://images.unsplash.com/photo-1620121692029-d088224ddc74?q=80&w=2832&auto=format&fit=crop",
+    primaryColor: "#f05340"
   });
+
+  React.useEffect(() => {
+    const saved = localStorage.getItem("email_config");
+    if (saved) {
+      try {
+        setEmailConfig(JSON.parse(saved));
+      } catch (e) {}
+    }
+  }, []);
 
   const saveEmailConfig = () => {
     localStorage.setItem("email_config", JSON.stringify(emailConfig));
